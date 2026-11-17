@@ -150,6 +150,7 @@ export interface ContractSigner {
   signatureDataUrl?: string;
   selfieDataUrl?: string;
   consentAccepted?: boolean;
+  ipAddress?: string; // recorded by the server at signing time
 }
 
 export interface ContractSignatureConfig {

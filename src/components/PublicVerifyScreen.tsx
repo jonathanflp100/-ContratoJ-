@@ -15,7 +15,8 @@ import {
 } from 'lucide-react';
 import { translations } from '../i18n/translations';
 import { generateContractPdfA4 } from '../services/contractExporter';
-import { storageService } from '../services/storage';
+import { publicApi } from '../services/api';
+import { storageService, storageSync } from '../services/storage';
 import type { ContractCompanySnapshot, ContractRecord, Locale } from '../types';
 import { getVerifyPublicUrl } from '../utils/cryptoAndDevice';
 
@@ -33,6 +34,8 @@ interface VerifyState {
   contract?: ContractRecord;
   computedHash?: string;
   company?: ContractCompanySnapshot | null;
+  /** Found by short code only: summary without content/hash. */
+  limited?: boolean;
 }
 
 export function PublicVerifyScreen({
@@ -60,7 +63,23 @@ export function PublicVerifyScreen({
   const runVerify = async (targetQuery: string) => {
     const clean = targetQuery.trim();
     if (!clean) return;
-    const res = await storageService.verifyContractByCodeOrHash(clean);
+    let res: {
+      found: boolean;
+      authentic: boolean;
+      contract?: ContractRecord;
+      computedHash?: string;
+      company?: ContractCompanySnapshot | null;
+      limited?: boolean;
+    } = { found: false, authentic: false };
+    try {
+      res = await publicApi.verify(clean);
+    } catch (err) {
+      console.error(err);
+    }
+    if (!res.found && storageSync.mode === 'local') {
+      // Demo contracts exist only in this browser.
+      res = await storageService.verifyContractByCodeOrHash(clean);
+    }
     setResult({
       checked: true,
       found: res.found,
@@ -68,8 +87,9 @@ export function PublicVerifyScreen({
       contract: res.contract,
       computedHash: res.computedHash,
       company: res.company,
+      limited: res.limited,
     });
-    if (res.found && res.authentic && res.contract) {
+    if (res.found && res.authentic && res.contract && !res.limited) {
       const url = getVerifyPublicUrl(
         res.computedHash || res.contract.documentHash || res.contract.code
       );
@@ -408,7 +428,16 @@ export function PublicVerifyScreen({
                   </div>
                 </div>
 
+                {result.limited && (
+                  <p className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-xl p-3">
+                    {locale === 'es-PY'
+                      ? 'Para ver el documento completo y el código SHA-256, escaneá el código QR del PDF firmado.'
+                      : 'Para ver o documento completo e o código SHA-256, escaneie o QR code do PDF assinado.'}
+                  </p>
+                )}
+
                 {/* Hash SHA-256 */}
+                {!result.limited && (
                 <div className="rounded-xl bg-slate-50 border border-slate-200 p-4 space-y-1.5">
                   <p className="text-xs font-semibold text-navy-900 flex items-center gap-1.5">
                     <QrCode className="h-3.5 w-3.5 text-emerald-700" />
@@ -418,6 +447,7 @@ export function PublicVerifyScreen({
                     {result.computedHash || result.contract.documentHash}
                   </p>
                 </div>
+                )}
 
                 {/* Signers Audit */}
                 {result.contract.signers &&
@@ -467,6 +497,7 @@ export function PublicVerifyScreen({
                     </div>
                   )}
 
+                {!result.limited && (
                 <div className="pt-2">
                   <button
                     type="button"
@@ -496,6 +527,7 @@ export function PublicVerifyScreen({
                     <span>{t.publicVerify.downloadPdfBtn}</span>
                   </button>
                 </div>
+                )}
               </div>
             </section>
           )}
