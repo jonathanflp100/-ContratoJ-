@@ -1,0 +1,6 @@
+{
+  "name": "ContratoJá",
+  "description": "Plataforma bilíngue (PT-BR / ES-PY) para empresas gerarem contratos a partir de modelos próprios e documentos de clientes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
