@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { ArrowRight, Check, Lock, Mail, ShieldCheck, User } from 'lucide-react';
+import { ArrowRight, Check, Loader2, Lock, Mail, ShieldCheck, User } from 'lucide-react';
 import type { TranslationDictionary } from '../i18n/translations';
 import type { Locale } from '../types';
 import { BrandMark } from './BrandMark';
@@ -9,8 +9,15 @@ interface AuthScreenProps {
   t: TranslationDictionary;
   locale: Locale;
   onLocaleChange: (locale: Locale) => void;
-  onSignIn: (email: string) => void;
-  onSignUp: (name: string, email: string) => void;
+  onSignIn: (
+    email: string,
+    password: string
+  ) => Promise<{ error?: string; info?: string }>;
+  onSignUp: (
+    name: string,
+    email: string,
+    password: string
+  ) => Promise<{ error?: string; info?: string }>;
   onDemoLogin: () => void;
   onOpenVerify: () => void;
 }
@@ -29,10 +36,14 @@ export function AuthScreen({
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
-  const handleSubmit = (e: FormEvent) => {
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    if (submitting) return;
     setError(null);
+    setInfo(null);
 
     const trimmedEmail = email.trim();
     if (!trimmedEmail || !trimmedEmail.includes('@')) {
@@ -48,10 +59,23 @@ export function AuthScreen({
         setError(t.auth.errorNameRequired);
         return;
       }
-      onSignUp(name.trim(), trimmedEmail);
-      return;
     }
-    onSignIn(trimmedEmail);
+    setSubmitting(true);
+    try {
+      const res =
+        mode === 'signup'
+          ? await onSignUp(name.trim(), trimmedEmail, password)
+          : await onSignIn(trimmedEmail, password);
+      if (res.error) setError(res.error);
+      if (res.info) {
+        setInfo(res.info);
+        setMode('signin');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -190,13 +214,23 @@ export function AuthScreen({
                   {error}
                 </p>
               )}
+              {info && (
+                <p role="status" className="text-sm text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-xl px-3.5 py-2.5">
+                  {info}
+                </p>
+              )}
 
               <button
                 type="submit"
-                className="w-full min-h-[48px] px-4 py-3 bg-navy-900 hover:bg-navy-800 text-white text-sm font-semibold rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                disabled={submitting}
+                className="w-full min-h-[48px] px-4 py-3 bg-navy-900 hover:bg-navy-800 disabled:opacity-60 text-white text-sm font-semibold rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer"
               >
                 <span>{mode === 'signup' ? t.auth.signUpBtn : t.auth.signInBtn}</span>
-                <ArrowRight className="h-4 w-4" />
+                {submitting ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <ArrowRight className="h-4 w-4" />
+                )}
               </button>
 
               {mode === 'signup' && (

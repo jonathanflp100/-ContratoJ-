@@ -20,7 +20,7 @@ interface CreditsScreenProps {
     country: CountryCode,
     paymentMethod: string,
     packageLabel: string
-  ) => void;
+  ) => Promise<string | null> | void;
 }
 
 export function CreditsScreen({
@@ -38,6 +38,8 @@ export function CreditsScreen({
     defaultCountry === 'PY' ? 'transfer_py' : 'pix'
   );
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [purchasing, setPurchasing] = useState(false);
 
   const getPackageCopy = (pkg: CreditPackage) => {
     if (pkg.id === 'avulso') {
@@ -56,8 +58,8 @@ export function CreditsScreen({
     };
   };
 
-  const handleConfirmPurchase = () => {
-    if (!checkoutPkg) return;
+  const handleConfirmPurchase = async () => {
+    if (!checkoutPkg || purchasing) return;
     const copy = getPackageCopy(checkoutPkg);
     const methodLabel =
       paymentMethod === 'pix'
@@ -66,10 +68,20 @@ export function CreditsScreen({
           ? t.credits.methodCard
           : t.credits.methodTransferPY;
 
-    onPurchase(checkoutPkg, currencyCountry, methodLabel, copy.name);
-    setCheckoutPkg(null);
-    setSuccessMsg(t.credits.purchaseSuccess);
-    setTimeout(() => setSuccessMsg(null), 4000);
+    setErrorMsg(null);
+    setPurchasing(true);
+    try {
+      const error = await onPurchase(checkoutPkg, currencyCountry, methodLabel, copy.name);
+      setCheckoutPkg(null);
+      if (error) {
+        setErrorMsg(error);
+        return;
+      }
+      setSuccessMsg(t.credits.purchaseSuccess);
+      setTimeout(() => setSuccessMsg(null), 4000);
+    } finally {
+      setPurchasing(false);
+    }
   };
 
   return (
@@ -132,6 +144,12 @@ export function CreditsScreen({
           {t.credits.consumptionRule}
         </p>
       </section>
+
+      {errorMsg && (
+        <div role="alert" className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-sm font-medium text-red-800">
+          {errorMsg}
+        </div>
+      )}
 
       {successMsg && (
         <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 text-sm font-medium text-emerald-800 flex items-center gap-2">

@@ -1,3 +1,4 @@
+import { jsonAuthHeaders } from './api';
 import mammoth from 'mammoth';
 import * as pdfjsLib from 'pdfjs-dist';
 import type {
@@ -95,7 +96,7 @@ export async function analyzeTemplateWithGemini(
 ): Promise<TemplateAnalysisResult> {
   const response = await fetch('/api/templates/analyze', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await jsonAuthHeaders(),
     body: JSON.stringify({ rawText, locale, country }),
   });
 
@@ -228,7 +229,7 @@ export async function extractFieldsFromDocuments(params: {
 }): Promise<DocumentExtractionItem[]> {
   const response = await fetch('/api/contracts/extract-documents', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await jsonAuthHeaders(),
     body: JSON.stringify(params),
   });
 
@@ -275,7 +276,7 @@ export async function reviewContractWithAI(params: {
 }): Promise<ContractReviewResult> {
   const response = await fetch('/api/contracts/review', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await jsonAuthHeaders(),
     body: JSON.stringify(params),
   });
 
@@ -303,7 +304,7 @@ export async function extractContractTermsWithAI(params: {
 }): Promise<ContractExpirationInfo> {
   const response = await fetch('/api/contracts/extract-terms', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await jsonAuthHeaders(),
     body: JSON.stringify(params),
   });
 
@@ -341,7 +342,7 @@ export async function anonymizeTemplateForLibraryWithAI(params: {
 }): Promise<AnonymizedClauseBundle> {
   const response = await fetch('/api/templates/anonymize-clauses', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await jsonAuthHeaders(),
     body: JSON.stringify(params),
   });
 

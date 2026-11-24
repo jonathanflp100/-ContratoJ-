@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { Loader2 } from 'lucide-react';
 import { AppShell } from './components/AppShell';
 import { AuthScreen } from './components/AuthScreen';
 import { ContractDetailModal } from './components/ContractDetailModal';
@@ -17,9 +18,19 @@ import { TemplatesScreen } from './components/TemplatesScreen';
 import { VaultScreen } from './components/VaultScreen';
 import { translations } from './i18n/translations';
 import {
+  creditsApi,
+  getCurrentAuthUser,
+  signInWithPassword,
+  signOutBackend,
+  signUpWithPassword,
+  workspaceApi,
+  type AuthUserInfo,
+} from './services/api';
+import {
   filterVisibleContractsForMember,
   getActiveTeamMember,
   storageService,
+  storageSync,
 } from './services/storage';
 import type {
   AppScreen,
@@ -32,6 +43,35 @@ import type {
 function readCurrentRoute(): string {
   if (typeof window === 'undefined') return '/';
   return `${window.location.pathname}${window.location.search}`;
+}
+
+function isPublicPath(route: string): boolean {
+  const path = route.split('?')[0];
+  return path.startsWith('/assinar/') || path.startsWith('/verificar');
+}
+
+function nameFromEmail(email: string): string {
+  const raw = email.split('@')[0].replace(/[._-]+/g, ' ').trim();
+  return (
+    raw
+      .split(' ')
+      .filter(Boolean)
+      .map((p) => p[0].toUpperCase() + p.slice(1))
+      .join(' ') || 'Usuário'
+  );
+}
+
+/** Loads (or creates) the company workspace of a logged-in account. */
+async function enterAccount(user: AuthUserInfo, fallbackName?: string) {
+  const server = await workspaceApi.load();
+  let snap = storageSync.enterRemote(server);
+  if (!server || !snap.user) {
+    // First login of this account: create company + seed templates; syncs to server.
+    snap = storageService.signUp(fallbackName || user.name || nameFromEmail(user.email), user.email);
+    await storageSync.flush();
+    snap = storageService.getSnapshot();
+  }
+  return snap;
 }
 
 export default function App() {
@@ -52,6 +92,103 @@ export default function App() {
   const [editingDraft, setEditingDraft] = useState<ContractRecord | null>(null);
   const [renewingContract, setRenewingContract] =
     useState<ContractRecord | null>(null);
+  const [booting, setBooting] = useState<boolean>(
+    () => !isPublicPath(readCurrentRoute())
+  );
+  const [syncBanner, setSyncBanner] = useState<
+    { kind: 'info' | 'error'; text: string } | null
+  >(null);
+
+  // Boot: restore the logged-in session and load data from the server.
+  useEffect(() => {
+    if (isPublicPath(readCurrentRoute())) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const user = await getCurrentAuthUser();
+        if (user && !cancelled) {
+          const snap = await enterAccount(user);
+          if (!cancelled) setSnapshot(snap);
+        }
+      } catch (err) {
+        console.error(err);
+        if (!cancelled) {
+          setSyncBanner({
+            kind: 'error',
+            text: 'Não foi possível carregar seus dados. Verifique a conexão e recarregue a página.',
+          });
+        }
+      } finally {
+        if (!cancelled) setBooting(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Server sync events → UI
+  useEffect(() => {
+    return storageSync.subscribe((ev) => {
+      if (ev.type === 'snapshot') {
+        setSnapshot(ev.snapshot);
+      } else if (ev.type === 'insufficient_credits') {
+        setSyncBanner({
+          kind: 'error',
+          text:
+            snapshot.locale === 'es-PY'
+              ? 'Créditos insuficientes: el último cambio no se guardó. Comprá créditos e intentá de nuevo.'
+              : 'Créditos insuficientes: a última alteração não foi salva. Compre créditos e tente de novo.',
+        });
+      } else if (ev.type === 'status') {
+        if (ev.status === 'offline') {
+          setSyncBanner({
+            kind: 'error',
+            text:
+              snapshot.locale === 'es-PY'
+                ? 'Sin conexión con el servidor. Reintentando guardar…'
+                : 'Sem conexão com o servidor. Tentando salvar de novo…',
+          });
+        } else if (ev.status === 'error' && ev.message === 'session') {
+          setSyncBanner({
+            kind: 'error',
+            text:
+              snapshot.locale === 'es-PY'
+                ? 'Tu sesión expiró. Salí e ingresá de nuevo para no perder cambios.'
+                : 'Sua sessão expirou. Saia e entre de novo para não perder alterações.',
+          });
+        } else if (ev.status === 'idle') {
+          setSyncBanner((prev) =>
+            prev && prev.text.includes('conex') ? null : prev
+          );
+        }
+      }
+    });
+  }, [snapshot.locale]);
+
+  // Pick up signatures made by clients on other devices.
+  useEffect(() => {
+    if (!snapshot.user || storageSync.mode !== 'remote') return;
+    const tick = () => void storageSync.refresh();
+    const id = window.setInterval(tick, 20000);
+    window.addEventListener('focus', tick);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener('focus', tick);
+    };
+  }, [snapshot.user]);
+
+  // Warn before closing the tab with unsaved changes.
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      if (storageSync.hasPendingChanges()) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, []);
 
   const locale = snapshot.locale;
   const t = translations[locale];
@@ -75,6 +212,9 @@ export default function App() {
     }
     setCurrentRoute(path);
     setSnapshot(storageService.getSnapshot());
+    if (path === '/' && storageSync.mode === 'remote') {
+      void storageSync.refresh();
+    }
     if (path === '/') {
       setSendModalContract(null);
       setSelectedContractId(null);
@@ -175,25 +315,61 @@ export default function App() {
     );
   }
 
-  const handleSignIn = (email: string) => {
-    const next = storageService.signIn(email);
-    setSnapshot(next);
-    setActiveScreen('dashboard');
+  const handleSignIn = async (
+    email: string,
+    password: string
+  ): Promise<{ error?: string; info?: string }> => {
+    const res = await signInWithPassword(email, password, locale);
+    if (!res.user) return { error: res.error };
+    try {
+      const next = await enterAccount(res.user);
+      setSnapshot(next);
+      setActiveScreen('dashboard');
+      return {};
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
   };
 
-  const handleSignUp = (name: string, email: string) => {
-    const next = storageService.signUp(name, email);
-    setSnapshot(next);
-    setActiveScreen('dashboard');
+  const handleSignUp = async (
+    name: string,
+    email: string,
+    password: string
+  ): Promise<{ error?: string; info?: string }> => {
+    const res = await signUpWithPassword(name, email, password, locale);
+    if (res.error) return { error: res.error };
+    if (res.needsEmailConfirmation || !res.user) {
+      return {
+        info:
+          locale === 'es-PY'
+            ? 'Te enviamos un correo de confirmación. Abrí el enlace y después ingresá con tu contraseña.'
+            : 'Enviamos um e-mail de confirmação. Abra o link e depois entre com sua senha.',
+      };
+    }
+    try {
+      const next = await enterAccount(res.user, name);
+      setSnapshot(next);
+      setActiveScreen('dashboard');
+      return {};
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
   };
 
   const handleDemoLogin = () => {
+    storageSync.enterLocal();
     const next = storageService.signInDemo(locale);
     setSnapshot(next);
     setActiveScreen('dashboard');
   };
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
+    if (storageSync.mode === 'remote') {
+      await storageSync.flush().catch(() => undefined);
+      await signOutBackend();
+      storageSync.enterLocal();
+    }
+    setSyncBanner(null);
     setSnapshot(storageService.signOut());
     setSelectedContractId(null);
     setSendModalContract(null);
@@ -212,6 +388,14 @@ export default function App() {
     setRenewingContract(renewFrom);
     setActiveScreen('new-contract');
   };
+
+  if (booting) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50">
+        <Loader2 className="h-8 w-8 animate-spin text-navy-900" />
+      </div>
+    );
+  }
 
   // 1. Unauthenticated -> Login / Cadastro
   if (!snapshot.user) {
@@ -274,6 +458,27 @@ export default function App() {
       onOpenVerify={() => navigateToPath('/verificar')}
       onSignOut={handleSignOut}
     >
+      {syncBanner && (
+        <div
+          role="alert"
+          className={`mb-4 flex items-start justify-between gap-3 rounded-xl border px-4 py-3 text-sm ${
+            syncBanner.kind === 'error'
+              ? 'border-amber-200 bg-amber-50 text-amber-900'
+              : 'border-emerald-200 bg-emerald-50 text-emerald-900'
+          }`}
+        >
+          <span>{syncBanner.text}</span>
+          <button
+            type="button"
+            onClick={() => setSyncBanner(null)}
+            className="shrink-0 font-semibold cursor-pointer"
+            aria-label="Fechar"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
       {activeScreen === 'dashboard' && (
         <DashboardScreen
           t={t}
@@ -444,15 +649,31 @@ export default function App() {
           defaultCountry={snapshot.company.country}
           credits={snapshot.credits}
           transactions={snapshot.transactions}
-          onPurchase={(pkg, country, paymentMethod, packageLabel) => {
-            setSnapshot(
-              storageService.purchaseCredits(
-                pkg,
+          onPurchase={async (pkg, country, paymentMethod, packageLabel) => {
+            if (storageSync.mode !== 'remote') {
+              setSnapshot(
+                storageService.purchaseCredits(
+                  pkg,
+                  country,
+                  paymentMethod,
+                  packageLabel
+                )
+              );
+              return null;
+            }
+            try {
+              await storageSync.flush();
+              const server = await creditsApi.purchase({
+                packageId: pkg.id,
                 country,
                 paymentMethod,
-                packageLabel
-              )
-            );
+                packageLabel,
+              });
+              setSnapshot(storageSync.applyServerCredits(server));
+              return null;
+            } catch (err) {
+              return err instanceof Error ? err.message : String(err);
+            }
           }}
         />
       )}
@@ -473,7 +694,13 @@ export default function App() {
             return res.purgedCount;
           }}
           onExportBackup={() => storageService.exportJsonBackup()}
-          onResetDemo={() => {
+          onResetDemo={async () => {
+            // Never overwrite a real account with demo data: leave it first.
+            if (storageSync.mode === 'remote') {
+              await storageSync.flush().catch(() => undefined);
+              await signOutBackend();
+              storageSync.enterLocal();
+            }
             setSnapshot(storageService.resetToDemo());
             setActiveScreen('dashboard');
           }}
@@ -538,6 +765,8 @@ export default function App() {
               requireSelfie,
             });
             setSnapshot(res.snapshot);
+            // Push right away so the WhatsApp link works the moment it is shared.
+            void storageSync.flush();
             if (res.legalApprovalRequired) {
               return { ok: false, legalApprovalRequired: true };
             }

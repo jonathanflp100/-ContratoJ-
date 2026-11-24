@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   Clock,
   FileDown,
+  Loader2,
   Lock,
   ShieldCheck,
   Sparkles,
@@ -13,7 +14,8 @@ import {
 } from 'lucide-react';
 import { translations } from '../i18n/translations';
 import { generateContractPdfA4 } from '../services/contractExporter';
-import { storageService } from '../services/storage';
+import { ApiError, publicApi, type PublicSignLookup } from '../services/api';
+import { storageService, storageSync } from '../services/storage';
 import type { ContractRecord, ContractSigner, Locale } from '../types';
 import {
   getClientAuditMetadata,
@@ -73,15 +75,14 @@ export function PublicSignScreen({
 }: PublicSignScreenProps) {
   const t = translations[locale];
 
-  const [lookup, setLookup] = useState(() =>
-    storageService.getPublicContractForSigning(contractId, token)
-  );
-  const [name, setName] = useState(lookup?.signer.name || '');
-  const [documentId, setDocumentId] = useState(lookup?.signer.document || '');
+  const [lookup, setLookup] = useState<PublicSignLookup | null>(null);
+  const [loadingLookup, setLoadingLookup] = useState(true);
+  /** Demo contracts live only in this browser; real ones come from the server. */
+  const [isLocalDemo, setIsLocalDemo] = useState(false);
+  const [name, setName] = useState('');
+  const [documentId, setDocumentId] = useState('');
   const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
-  const [selfieDataUrl, setSelfieDataUrl] = useState<string | null>(
-    lookup?.signer.selfieDataUrl || null
-  );
+  const [selfieDataUrl, setSelfieDataUrl] = useState<string | null>(null);
   const [consentAccepted, setConsentAccepted] = useState(false);
 
   // Scroll-to-end enforcement
@@ -106,21 +107,42 @@ export function PublicSignScreen({
 
   // Refresh lookup when route changes & log "viewed" event
   useEffect(() => {
-    const data = storageService.getPublicContractForSigning(contractId, token);
-    setLookup(data);
-    if (data) {
-      setName(data.signer.name);
-      setDocumentId(data.signer.document);
-      setSelfieDataUrl(data.signer.selfieDataUrl || null);
-      if (data.signer.status === 'pending' && !data.blockedBySigner) {
-        storageService.recordSignerView(
-          contractId,
-          token,
-          getClientAuditMetadata()
-        );
-        onSnapshotUpdated?.();
+    let cancelled = false;
+    setLoadingLookup(true);
+    (async () => {
+      let data: PublicSignLookup | null = null;
+      let local = false;
+      try {
+        data = await publicApi.getSignLookup(contractId, token);
+      } catch (err) {
+        console.error(err);
       }
-    }
+      if (!data && storageSync.mode === 'local') {
+        data = storageService.getPublicContractForSigning(contractId, token);
+        local = Boolean(data);
+      }
+      if (cancelled) return;
+      setLookup(data);
+      setIsLocalDemo(local);
+      setLoadingLookup(false);
+      if (data) {
+        setName(data.signer.name);
+        setDocumentId(data.signer.document);
+        setSelfieDataUrl(data.signer.selfieDataUrl || null);
+        if (data.signer.status === 'pending' && !data.blockedBySigner) {
+          const audit = getClientAuditMetadata();
+          if (local) {
+            storageService.recordSignerView(contractId, token, audit);
+            onSnapshotUpdated?.();
+          } else {
+            publicApi.recordView(contractId, token, audit).catch(() => undefined);
+          }
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [contractId, token]);
 
   // Check if contract fits without scrolling
@@ -251,14 +273,17 @@ export function PublicSignScreen({
     setIsSubmitting(true);
     try {
       const audit = getClientAuditMetadata();
-      const res = await storageService.submitSignerSignature(contractId, token, {
+      const payload = {
         name,
         document: documentId,
         signatureDataUrl,
         selfieDataUrl: selfieDataUrl || undefined,
         consentAccepted: true,
         audit,
-      });
+      };
+      const res = isLocalDemo
+        ? await storageService.submitSignerSignature(contractId, token, payload)
+        : await publicApi.submitSignature(contractId, token, payload);
 
       if (res) {
         setCompletedResult({
@@ -269,6 +294,12 @@ export function PublicSignScreen({
         });
         onSnapshotUpdated?.();
       }
+    } catch (err) {
+      setFormError(
+        err instanceof ApiError || err instanceof Error
+          ? err.message
+          : t.publicSign.errorFieldsRequired
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -347,7 +378,13 @@ export function PublicSignScreen({
 
       <main className="flex-1 max-w-3xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8">
         {/* Not Found */}
-        {!lookup && (
+        {loadingLookup && (
+          <div className="py-16 flex justify-center">
+            <Loader2 className="h-8 w-8 animate-spin text-navy-900" />
+          </div>
+        )}
+
+        {!loadingLookup && !lookup && (
           <div className="bg-white border border-slate-200 rounded-2xl p-8 text-center space-y-4">
             <AlertCircle className="h-10 w-10 text-red-500 mx-auto" />
             <h1 className="text-xl font-bold text-navy-900">

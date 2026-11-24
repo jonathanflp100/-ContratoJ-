@@ -3,12 +3,22 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
+import { registerApiRoutes } from './server/api.ts';
+import { createAuthMiddleware, createRateLimiter } from './server/auth.ts';
+import {
+  createAdminClient,
+  createStore,
+  isSupabaseConfigured,
+  readBackendConfig,
+} from './server/store.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
+// Model chosen by AI Studio; override with GEMINI_MODEL if it is renamed/retired.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-4-hydrogen';
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -27,10 +37,61 @@ function getGeminiClient(): GoogleGenAI {
 
 async function startServer() {
   const app = express();
+  // Behind Cloud Run / Vercel / Nginx: trust the first proxy hop for req.ip.
+  app.set('trust proxy', 1);
 
   app.use(express.json({ limit: '25mb' }));
 
-  app.post('/api/templates/analyze', async (req, res) => {
+  const backend = readBackendConfig();
+  const supabaseOn = isSupabaseConfigured(backend);
+  if (!supabaseOn && backend.isProduction) {
+    console.error(
+      '[ContratoJá] ATENÇÃO: rodando em produção SEM Supabase. Os dados ficam só neste servidor ' +
+        'e o login é desativado. Configure SUPABASE_URL, SUPABASE_ANON_KEY e SUPABASE_SERVICE_ROLE_KEY.'
+    );
+  }
+  const admin = createAdminClient(backend);
+  const store = createStore(backend, admin);
+  const allowDevAuth = !supabaseOn && !backend.isProduction;
+  const { requireAuth, optionalAuth } = createAuthMiddleware({ admin, allowDevAuth });
+  const userAiLimiter = createRateLimiter({ windowMs: 60_000, max: 20, keyPrefix: 'ai' });
+  // Demo account (not logged in) can try the AI, but only a few calls per hour per IP.
+  const demoAiPerHour = Number(process.env.DEMO_AI_PER_HOUR ?? 15);
+  const demoAiLimiter = createRateLimiter({
+    windowMs: 3_600_000,
+    max: demoAiPerHour,
+    keyPrefix: 'ai-demo',
+  });
+  const aiLimiter: express.RequestHandler[] = [
+    optionalAuth,
+    (req, res, next) => {
+      if (req.authUser) return userAiLimiter(req, res, next);
+      if (demoAiPerHour <= 0) {
+        res.status(401).json({ error: 'Entre na sua conta para usar a IA.' });
+        return;
+      }
+      return demoAiLimiter(req, res, next);
+    },
+  ];
+  const publicLimiter = createRateLimiter({ windowMs: 60_000, max: 60, keyPrefix: 'pub' });
+  const allowSimulatedPayments =
+    process.env.ALLOW_SIMULATED_PAYMENTS === 'true' ||
+    (process.env.ALLOW_SIMULATED_PAYMENTS !== 'false' && !backend.isProduction);
+
+  registerApiRoutes(app, {
+    store,
+    requireAuth,
+    publicLimiter,
+    allowSimulatedPayments,
+    clientConfig: {
+      authMode: supabaseOn ? 'supabase' : allowDevAuth ? 'dev' : 'disabled',
+      supabaseUrl: supabaseOn ? backend.supabaseUrl : '',
+      supabaseAnonKey: supabaseOn ? backend.supabaseAnonKey : '',
+      simulatedPayments: allowSimulatedPayments,
+    },
+  });
+
+  app.post('/api/templates/analyze', ...aiLimiter, async (req, res) => {
     try {
       const { rawText, locale, country } = req.body as {
         rawText?: string;
@@ -63,7 +124,7 @@ REGRAS OBRIGATÓRIAS:
 6. País padrão de contexto: ${country === 'PY' ? 'Paraguai (RUC, C.I., Guaraníes)' : 'Brasil (CPF/CNPJ, RG, Reais)'}.`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model: GEMINI_MODEL,
         contents: `Analise o documento abaixo e extraia o modelo parametrizado em JSON:\n\n${rawText.slice(0, 60000)}`,
         config: {
           systemInstruction,
@@ -141,7 +202,7 @@ REGRAS OBRIGATÓRIAS:
     }
   });
 
-  app.post('/api/contracts/extract-documents', async (req, res) => {
+  app.post('/api/contracts/extract-documents', ...aiLimiter, async (req, res) => {
     try {
       const { documents, fields, country, locale } = req.body as {
         documents?: Array<{
@@ -219,7 +280,7 @@ INSTRUÇÕES IMPORTANTES:
       });
 
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model: GEMINI_MODEL,
         contents: { parts },
         config: {
           responseMimeType: 'application/json',
@@ -268,7 +329,7 @@ INSTRUÇÕES IMPORTANTES:
     }
   });
 
-  app.post('/api/contracts/review', async (req, res) => {
+  app.post('/api/contracts/review', ...aiLimiter, async (req, res) => {
     try {
       const { contractText, category, country, locale, variables } = req.body as {
         contractText?: string;
@@ -322,7 +383,7 @@ Analise o contrato preenchido e os dados informados procurando:
    - "clauseText": texto completo da cláusula numerada/redigida pronto para ser inserido no contrato.`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model: GEMINI_MODEL,
         contents: `DADOS PREENCHIDOS:\n${JSON.stringify(variables || {}, null, 2)}\n\nTEXTO DO CONTRATO:\n${contractText.slice(0, 60000)}`,
         config: {
           systemInstruction,
@@ -394,7 +455,7 @@ Analise o contrato preenchido e os dados informados procurando:
     }
   });
 
-  app.post('/api/contracts/extract-terms', async (req, res) => {
+  app.post('/api/contracts/extract-terms', ...aiLimiter, async (req, res) => {
     try {
       const { contractText, variables, country, locale } = req.body as {
         contractText?: string;
@@ -418,7 +479,7 @@ Analise o texto do contrato e os dados preenchidos para extrair:
 4. "summary": resumo curto em 1 frase no idioma ${locale === 'es-PY' ? 'Español' : 'Português'} explicando a vigência e regra de reajuste encontrada.`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model: GEMINI_MODEL,
         contents: `VARIÁVEIS:\n${JSON.stringify(variables || {}, null, 2)}\n\nCONTRATO:\n${contractText.slice(0, 40000)}`,
         config: {
           systemInstruction,
@@ -449,7 +510,7 @@ Analise o texto do contrato e os dados preenchidos para extrair:
     }
   });
 
-  app.post('/api/templates/anonymize-clauses', async (req, res) => {
+  app.post('/api/templates/anonymize-clauses', ...aiLimiter, async (req, res) => {
     try {
       const { templateText, category, country, locale } = req.body as {
         templateText?: string;
@@ -475,7 +536,7 @@ REGRAS CRÍTICAS DE ANONIMIZAÇÃO:
 4. Idioma: ${locale === 'es-PY' ? 'Español (Paraguay)' : 'Português (Brasil)'}.`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model: GEMINI_MODEL,
         contents: `Extraia e anonimize as cláusulas deste modelo:\n\n${templateText.slice(0, 45000)}`,
         config: {
           systemInstruction,

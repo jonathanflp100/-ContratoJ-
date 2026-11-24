@@ -21,6 +21,7 @@ import type {
   TemplateField,
   UserAccount,
 } from '../types';
+import { ApiError, workspaceApi } from './api';
 import {
   computeContractSha256,
   getSignerPublicUrl,
@@ -63,19 +64,23 @@ export const BRAND_COLOR_OPTIONS = [
   { label: 'Ouro Sóbrio', value: '#92400E' },
 ];
 
-function generateId(prefix: string): string {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+function randomHex(bytes: number): string {
+  const arr = new Uint8Array(bytes);
+  if (typeof window !== 'undefined' && window.crypto?.getRandomValues) {
+    window.crypto.getRandomValues(arr);
+  } else {
+    for (let i = 0; i < bytes; i++) arr[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+function generateId(prefix: string): string {
+  return `${prefix}_${Date.now().toString(36)}_${randomHex(4)}`;
+}
+
+/** 128-bit secret: the signing link is the only "password" a signer has. */
 function generateSignerToken(): string {
-  if (typeof window !== 'undefined' && window.crypto?.getRandomValues) {
-    const arr = new Uint8Array(9);
-    window.crypto.getRandomValues(arr);
-    return Array.from(arr, (b) => b.toString(36).padStart(2, '0'))
-      .join('')
-      .slice(0, 14);
-  }
-  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+  return randomHex(16);
 }
 
 function toCompanySnapshot(
@@ -709,91 +714,309 @@ function getDefaultSnapshot(): AppStorageSnapshot {
   };
 }
 
-function readSnapshot(): AppStorageSnapshot {
+/**
+ * Fills defaults, seeds system templates and purges expired client uploads.
+ * Used both for server snapshots and for the local demo copy.
+ */
+function normalizeSnapshot(parsed: AppStorageSnapshot): {
+  snapshot: AppStorageSnapshot;
+  changed: boolean;
+} {
+  const country: CountryCode =
+    parsed.company?.country || (parsed.locale === 'es-PY' ? 'PY' : 'BR');
+  const companyId = parsed.company?.id || 'cmp_local';
+
+  let templates = (parsed.templates || []).map((t) =>
+    normalizeTemplate(t, companyId, country)
+  );
+
+  // Ensure the 4 ContratoJá system templates exist on upgrade from v1
+  if (parsed.user && !templates.some((t) => t.isSystemTemplate)) {
+    const seeds = buildSeedTemplates(companyId, country);
+    templates = [...templates, ...seeds];
+  }
+
+  const company = parsed.company
+    ? {
+        ...parsed.company,
+        documentRetentionDays: parsed.company.documentRetentionDays ?? 90,
+        autoDeleteClientDocs: parsed.company.autoDeleteClientDocs ?? true,
+        requireLegalApproval: parsed.company.requireLegalApproval ?? false,
+      }
+    : null;
+
+  const teamMembers: TeamMember[] =
+    Array.isArray(parsed.teamMembers) && parsed.teamMembers.length > 0
+      ? parsed.teamMembers
+      : parsed.user
+        ? [
+            {
+              id: parsed.user.id,
+              name: parsed.user.name,
+              email: parsed.user.email,
+              role: 'admin',
+              status: 'active',
+              invitedAt: parsed.user.createdAt,
+            },
+          ]
+        : [];
+
+  const clauseLibrary: SharedClauseItem[] =
+    Array.isArray(parsed.clauseLibrary) && parsed.clauseLibrary.length > 0
+      ? parsed.clauseLibrary
+      : buildSeedClauseLibrary(country);
+
+  const retentionDays = company?.documentRetentionDays ?? 90;
+  const autoDelete = company?.autoDeleteClientDocs ?? true;
+  const { contracts: purgedContracts, purgedCount } =
+    purgeExpiredAttachmentsInContracts(
+      parsed.contracts || [],
+      retentionDays,
+      autoDelete
+    );
+
+  const nextSnapshot: AppStorageSnapshot = {
+    ...getDefaultSnapshot(),
+    ...parsed,
+    company,
+    templates,
+    contracts: purgedContracts,
+    teamMembers,
+    activeMemberId:
+      parsed.activeMemberId || teamMembers[0]?.id || null,
+    clauseLibrary,
+  };
+
+  return { snapshot: nextSnapshot, changed: purgedCount > 0 };
+}
+
+/* ------------------------------------------------------------------ */
+/* In-memory state + server sync                                       */
+/* ------------------------------------------------------------------ */
+/*
+ * "remote" mode (logged-in account): the server (Supabase) is the source of
+ * truth. Every write updates memory immediately (UI stays synchronous) and is
+ * pushed to PUT /api/workspace a moment later. Nothing big is stored in
+ * localStorage anymore (it only holds ~5 MB and selfies/signatures blew it).
+ *
+ * "local" mode: only for the offline demo account (signInDemo).
+ */
+
+type SyncMode = 'local' | 'remote';
+export type SyncStatus = 'idle' | 'saving' | 'offline' | 'error';
+export type SyncEvent =
+  | { type: 'snapshot'; snapshot: AppStorageSnapshot }
+  | { type: 'status'; status: SyncStatus; message?: string }
+  | { type: 'insufficient_credits' };
+
+let syncMode: SyncMode = 'local';
+let memory: AppStorageSnapshot | null = null;
+let localRevision = 0;
+let syncedRevision = 0;
+let syncTimer: ReturnType<typeof setTimeout> | null = null;
+let inflight: Promise<void> | null = null;
+let retryDelay = 2000;
+const listeners = new Set<(ev: SyncEvent) => void>();
+
+function emit(ev: SyncEvent) {
+  listeners.forEach((fn) => {
+    try {
+      fn(ev);
+    } catch (err) {
+      console.error(err);
+    }
+  });
+}
+
+function readLocalDemo(): AppStorageSnapshot {
   try {
     const raw =
       localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
     if (!raw) return getDefaultSnapshot();
-    const parsed = JSON.parse(raw) as AppStorageSnapshot;
-    const country: CountryCode =
-      parsed.company?.country || (parsed.locale === 'es-PY' ? 'PY' : 'BR');
-    const companyId = parsed.company?.id || 'cmp_local';
-
-    let templates = (parsed.templates || []).map((t) =>
-      normalizeTemplate(t, companyId, country)
-    );
-
-    // Ensure the 4 ContratoJá system templates exist on upgrade from v1
-    if (parsed.user && !templates.some((t) => t.isSystemTemplate)) {
-      const seeds = buildSeedTemplates(companyId, country);
-      templates = [...templates, ...seeds];
-    }
-
-    const company = parsed.company
-      ? {
-          ...parsed.company,
-          documentRetentionDays: parsed.company.documentRetentionDays ?? 90,
-          autoDeleteClientDocs: parsed.company.autoDeleteClientDocs ?? true,
-          requireLegalApproval: parsed.company.requireLegalApproval ?? false,
-        }
-      : null;
-
-    const teamMembers: TeamMember[] =
-      Array.isArray(parsed.teamMembers) && parsed.teamMembers.length > 0
-        ? parsed.teamMembers
-        : parsed.user
-          ? [
-              {
-                id: parsed.user.id,
-                name: parsed.user.name,
-                email: parsed.user.email,
-                role: 'admin',
-                status: 'active',
-                invitedAt: parsed.user.createdAt,
-              },
-            ]
-          : [];
-
-    const clauseLibrary: SharedClauseItem[] =
-      Array.isArray(parsed.clauseLibrary) && parsed.clauseLibrary.length > 0
-        ? parsed.clauseLibrary
-        : buildSeedClauseLibrary(country);
-
-    const retentionDays = company?.documentRetentionDays ?? 90;
-    const autoDelete = company?.autoDeleteClientDocs ?? true;
-    const { contracts: purgedContracts, purgedCount } =
-      purgeExpiredAttachmentsInContracts(
-        parsed.contracts || [],
-        retentionDays,
-        autoDelete
-      );
-
-    const nextSnapshot: AppStorageSnapshot = {
-      ...getDefaultSnapshot(),
-      ...parsed,
-      company,
-      templates,
-      contracts: purgedContracts,
-      teamMembers,
-      activeMemberId:
-        parsed.activeMemberId || teamMembers[0]?.id || null,
-      clauseLibrary,
-    };
-
-    if (purgedCount > 0) {
-      writeSnapshot(nextSnapshot);
-    }
-
-    return nextSnapshot;
+    const { snapshot, changed } = normalizeSnapshot(JSON.parse(raw) as AppStorageSnapshot);
+    if (changed) writeLocalDemo(snapshot);
+    return snapshot;
   } catch {
     return getDefaultSnapshot();
   }
 }
 
-function writeSnapshot(snapshot: AppStorageSnapshot): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
-  localStorage.setItem('contratoja_locale', snapshot.locale);
+function writeLocalDemo(snapshot: AppStorageSnapshot) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+  } catch (err) {
+    // Quota exceeded: keep working from memory instead of crashing the app.
+    console.warn('[storage] localStorage cheio; dados do demo ficam só nesta aba.', err);
+  }
 }
+
+function readSnapshot(): AppStorageSnapshot {
+  if (!memory) {
+    memory = syncMode === 'local' ? readLocalDemo() : getDefaultSnapshot();
+  }
+  return memory;
+}
+
+function writeSnapshot(snapshot: AppStorageSnapshot): void {
+  memory = snapshot;
+  try {
+    localStorage.setItem('contratoja_locale', snapshot.locale);
+  } catch {
+    /* ignore */
+  }
+  if (syncMode === 'local') {
+    writeLocalDemo(snapshot);
+    return;
+  }
+  localRevision += 1;
+  scheduleSync(600);
+}
+
+function scheduleSync(delay: number) {
+  if (syncMode !== 'remote') return;
+  if (syncTimer) clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => {
+    syncTimer = null;
+    void runSync();
+  }, delay);
+}
+
+async function runSync(): Promise<void> {
+  if (syncMode !== 'remote' || !memory) return;
+  if (inflight) {
+    await inflight;
+    if (localRevision !== syncedRevision) scheduleSync(50);
+    return;
+  }
+  if (localRevision === syncedRevision) return;
+
+  const sentRevision = localRevision;
+  const sent = memory;
+  emit({ type: 'status', status: 'saving' });
+
+  inflight = (async () => {
+    try {
+      const server = await workspaceApi.save(sent);
+      retryDelay = 2000;
+      syncedRevision = Math.max(syncedRevision, sentRevision);
+      if (syncMode !== 'remote') return;
+      if (localRevision === sentRevision) {
+        // Nothing changed meanwhile: adopt the server view (credits, signatures…)
+        memory = normalizeSnapshot(server).snapshot;
+        emit({ type: 'snapshot', snapshot: memory });
+      } else if (memory) {
+        // User kept editing: keep local edits, but trust server credits.
+        memory = { ...memory, credits: server.credits, transactions: server.transactions };
+        emit({ type: 'snapshot', snapshot: memory });
+      }
+      emit({ type: 'status', status: 'idle' });
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'insufficient_credits') {
+        const serverSnap = err.body.snapshot as AppStorageSnapshot | null;
+        syncedRevision = localRevision;
+        if (serverSnap) {
+          memory = normalizeSnapshot(serverSnap).snapshot;
+          emit({ type: 'snapshot', snapshot: memory });
+        }
+        emit({ type: 'insufficient_credits' });
+        emit({ type: 'status', status: 'idle' });
+        return;
+      }
+      if (err instanceof ApiError && err.status === 401) {
+        emit({ type: 'status', status: 'error', message: 'session' });
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      emit({ type: 'status', status: 'offline', message });
+      retryDelay = Math.min(retryDelay * 2, 30000);
+      scheduleSync(retryDelay);
+    }
+  })();
+
+  try {
+    await inflight;
+  } finally {
+    inflight = null;
+  }
+  if (localRevision !== syncedRevision) scheduleSync(50);
+}
+
+export const storageSync = {
+  get mode(): SyncMode {
+    return syncMode;
+  },
+
+  /** Logged-in account: start from the server snapshot (or empty). */
+  enterRemote(serverSnapshot: AppStorageSnapshot | null): AppStorageSnapshot {
+    syncMode = 'remote';
+    localRevision = 0;
+    syncedRevision = 0;
+    retryDelay = 2000;
+    if (serverSnapshot) {
+      const { snapshot, changed } = normalizeSnapshot(serverSnapshot);
+      memory = snapshot;
+      if (changed) {
+        localRevision = 1;
+        scheduleSync(600);
+      }
+    } else {
+      memory = getDefaultSnapshot();
+    }
+    return memory;
+  },
+
+  /** Back to the offline demo / logged-out state. */
+  enterLocal(): AppStorageSnapshot {
+    if (syncTimer) clearTimeout(syncTimer);
+    syncTimer = null;
+    syncMode = 'local';
+    memory = null;
+    localRevision = 0;
+    syncedRevision = 0;
+    return readSnapshot();
+  },
+
+  /** Pull the latest server state (e.g. a client just signed). */
+  async refresh(): Promise<void> {
+    if (syncMode !== 'remote' || inflight || localRevision !== syncedRevision) return;
+    try {
+      const server = await workspaceApi.load();
+      if (!server || syncMode !== 'remote' || localRevision !== syncedRevision) return;
+      memory = normalizeSnapshot(server).snapshot;
+      emit({ type: 'snapshot', snapshot: memory });
+    } catch {
+      /* next poll will retry */
+    }
+  },
+
+  /** Wait until local edits reached the server. */
+  async flush(): Promise<void> {
+    if (syncMode !== 'remote') return;
+    if (syncTimer) {
+      clearTimeout(syncTimer);
+      syncTimer = null;
+    }
+    await runSync();
+    if (inflight) await inflight;
+  },
+
+  hasPendingChanges(): boolean {
+    return syncMode === 'remote' && localRevision !== syncedRevision;
+  },
+
+  /** Apply credits/ledger coming from a server-only operation (purchase). */
+  applyServerCredits(server: AppStorageSnapshot): AppStorageSnapshot {
+    const current = readSnapshot();
+    memory = { ...current, credits: server.credits, transactions: server.transactions };
+    emit({ type: 'snapshot', snapshot: memory });
+    return memory;
+  },
+
+  subscribe(fn: (ev: SyncEvent) => void): () => void {
+    listeners.add(fn);
+    return () => listeners.delete(fn);
+  },
+};
 
 export const storageService = {
   getSnapshot(): AppStorageSnapshot {
